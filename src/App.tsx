@@ -439,6 +439,35 @@ function App() {
           </div>
         </div>
 
+        <div className="sidebar-footer">
+          {isAdding ? (
+            <form className="add-form" onSubmit={handleAddPodcast}>
+              <input
+                value={newUrl}
+                onChange={(event) => setNewUrl(event.target.value)}
+                placeholder="Paste podcast site or RSS URL"
+              />
+              <div className="add-actions">
+                <button type="submit" className="primary" disabled={isFetching}>
+                  {isFetching ? "Finding feed..." : "Add podcast"}
+                </button>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => setIsAdding(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          ) : (
+            <button type="button" className="ghost add-button" onClick={() => setIsAdding(true)}>
+              <IconPlus />
+              Add podcast
+            </button>
+          )}
+        </div>
+
         <div className="sidebar-section">
           <div className="sidebar-section-header">
             <span>Podcasts</span>
@@ -494,34 +523,6 @@ function App() {
           </div>
         </div>
 
-        <div className="sidebar-footer">
-          {isAdding ? (
-            <form className="add-form" onSubmit={handleAddPodcast}>
-              <input
-                value={newUrl}
-                onChange={(event) => setNewUrl(event.target.value)}
-                placeholder="Paste podcast site or RSS URL"
-              />
-              <div className="add-actions">
-                <button type="submit" className="primary" disabled={isFetching}>
-                  {isFetching ? "Finding feed..." : "Add podcast"}
-                </button>
-                <button
-                  type="button"
-                  className="ghost"
-                  onClick={() => setIsAdding(false)}
-                >
-                  Cancel
-                </button>
-              </div>
-            </form>
-          ) : (
-            <button type="button" className="ghost add-button" onClick={() => setIsAdding(true)}>
-              <IconPlus />
-              Add podcast
-            </button>
-          )}
-        </div>
       </aside>
 
       <main className="main">
