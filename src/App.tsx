@@ -19,7 +19,7 @@ import {
 } from "./components/Icons";
 import { discoverFeedUrl, fetchFeed } from "./lib/feed";
 import { canUseTauriApis, safeFetch } from "./lib/http";
-import { isStoredState, loadStoredState, saveStoredState } from "./lib/storage";
+import { loadStoredState, saveStoredState } from "./lib/storage";
 import type { Episode, EpisodeStatus, Podcast } from "./lib/types";
 import {
   DEFAULT_PAGE_SIZE,
@@ -30,6 +30,47 @@ import {
   shortenUrl
 } from "./lib/utils";
 import "./App.css";
+
+type ExportEpisodeState = { id: string; status: EpisodeStatus };
+type ExportPodcastState = { id: string; feedUrl: string; episodeStates: ExportEpisodeState[] };
+type ExportState = {
+  version: 1;
+  podcasts: ExportPodcastState[];
+  activePodcastId?: string | null;
+};
+
+const exportStatusSet: Set<EpisodeStatus> = new Set([
+  "none",
+  "downloading",
+  "downloaded",
+  "skipped",
+  "error"
+]);
+
+const isExportState = (value: unknown): value is ExportState => {
+  if (!value || typeof value !== "object") return false;
+  const maybe = value as { version?: unknown; podcasts?: unknown };
+  if (maybe.version !== 1 || !Array.isArray(maybe.podcasts)) return false;
+  return maybe.podcasts.every((podcast) => {
+    if (!podcast || typeof podcast !== "object") return false;
+    const entry = podcast as {
+      id?: unknown;
+      feedUrl?: unknown;
+      episodeStates?: unknown;
+    };
+    if (typeof entry.id !== "string" || typeof entry.feedUrl !== "string") return false;
+    if (!Array.isArray(entry.episodeStates)) return false;
+    return entry.episodeStates.every((episode) => {
+      if (!episode || typeof episode !== "object") return false;
+      const state = episode as { id?: unknown; status?: unknown };
+      return (
+        typeof state.id === "string" &&
+        typeof state.status === "string" &&
+        exportStatusSet.has(state.status as EpisodeStatus)
+      );
+    });
+  });
+};
 
 const createPodcastId = (feedUrl: string) => {
   let hash = 5381;
@@ -285,11 +326,19 @@ function App() {
     });
     if (!destination) return;
     try {
-      const payload = JSON.stringify(
-        { podcasts, activePodcastId, downloadDir },
-        null,
-        2
-      );
+      const exportState: ExportState = {
+        version: 1,
+        activePodcastId,
+        podcasts: podcasts.map((podcast) => ({
+          id: podcast.id,
+          feedUrl: podcast.feedUrl,
+          episodeStates: podcast.episodes.map((episode) => ({
+            id: episode.id,
+            status: episode.status
+          }))
+        }))
+      };
+      const payload = JSON.stringify(exportState, null, 2);
       await writeTextFile(destination, payload);
       setStatusMessage("State exported.");
     } catch (error) {
@@ -313,18 +362,60 @@ function App() {
     try {
       const raw = await readTextFile(selection);
       const parsed = JSON.parse(raw) as unknown;
-      if (!isStoredState(parsed)) {
+      if (!isExportState(parsed)) {
         setStatusMessage("Invalid state file.");
         return;
       }
-      setPodcasts(parsed.podcasts);
-      setActivePodcastId(parsed.activePodcastId ?? parsed.podcasts?.[0]?.id ?? null);
-      setDownloadDir(parsed.downloadDir ?? "");
+      setIsFetching(true);
+      const importedPodcasts: Podcast[] = [];
+      for (const entry of parsed.podcasts) {
+        try {
+          const feed = await fetchFeed(entry.feedUrl);
+          const statusMap = new Map(
+            entry.episodeStates.map((episodeState) => [
+              episodeState.id,
+              episodeState.status === "downloading" ? "none" : episodeState.status
+            ])
+          );
+          const episodes = sortEpisodes(
+            feed.episodes.map((episode) => ({
+              ...episode,
+              status: statusMap.get(episode.id) ?? "none"
+            }))
+          );
+          importedPodcasts.push({
+            id: entry.id,
+            title: feed.title,
+            description: feed.description,
+            imageUrl: feed.imageUrl,
+            siteUrl: feed.siteUrl,
+            feedUrl: feed.feedUrl,
+            episodes,
+            nextUrl: feed.nextUrl,
+            visibleCount: DEFAULT_PAGE_SIZE
+          });
+        } catch {
+          setStatusMessage(`Failed to refresh ${entry.feedUrl}`);
+        }
+      }
+      if (importedPodcasts.length === 0) {
+        setStatusMessage("No podcasts could be imported.");
+        return;
+      }
+      setPodcasts(importedPodcasts);
+      const nextActive =
+        parsed.activePodcastId &&
+        importedPodcasts.some((podcast) => podcast.id === parsed.activePodcastId)
+          ? parsed.activePodcastId
+          : importedPodcasts[0].id;
+      setActivePodcastId(nextActive);
       setStatusMessage("State imported.");
     } catch (error) {
       setStatusMessage(
         error instanceof Error ? error.message : "Import failed"
       );
+    } finally {
+      setIsFetching(false);
     }
   };
 
