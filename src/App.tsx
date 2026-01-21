@@ -82,6 +82,20 @@ const createPodcastId = (feedUrl: string) => {
 
 const joinPath = (dir: string, file: string) => `${dir.replace(/\/+$/g, "")}/${file}`;
 
+const shortHash = (value: string) => {
+  let hash = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
+  }
+  return hash.toString(36).slice(0, 5).padEnd(5, "0");
+};
+
+const buildEpisodeFilename = (podcastId: string, episodeId: string, title: string, ext: string) => {
+  const safeTitle = sanitizeFilename(title).slice(0, 60);
+  const suffix = shortHash(`${podcastId}-${episodeId}`);
+  return `${safeTitle}-${suffix}${ext}`;
+};
+
 const mergeEpisodes = (existing: Episode[], incoming: Episode[]): Episode[] => {
   const existingById = new Map(existing.map((episode) => [episode.id, episode]));
   const incomingIds = new Set(incoming.map((episode) => episode.id));
@@ -541,7 +555,12 @@ function App() {
         throw new Error(`Download failed (${response.status})`);
       }
       const bytes = new Uint8Array(await response.arrayBuffer());
-      const filename = `${sanitizeFilename(episode.title)}${guessExtension(episode.audioUrl)}`;
+      const filename = buildEpisodeFilename(
+        activePodcast.id,
+        episode.id,
+        episode.title,
+        guessExtension(episode.audioUrl)
+      );
       const filePath = joinPath(destinationDir, filename);
       await writeFile(filePath, bytes);
 
