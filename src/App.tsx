@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
-import { writeFile } from "@tauri-apps/plugin-fs";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { readTextFile, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   IconCheck,
@@ -19,7 +19,7 @@ import {
 } from "./components/Icons";
 import { discoverFeedUrl, fetchFeed } from "./lib/feed";
 import { canUseTauriApis, safeFetch } from "./lib/http";
-import { loadStoredState, saveStoredState } from "./lib/storage";
+import { isStoredState, loadStoredState, saveStoredState } from "./lib/storage";
 import type { Episode, EpisodeStatus, Podcast } from "./lib/types";
 import {
   DEFAULT_PAGE_SIZE,
@@ -273,6 +273,61 @@ function App() {
     }
   };
 
+  const handleExportState = async () => {
+    if (!canUseTauriApis()) {
+      setStatusMessage("Export is available in the desktop app runtime.");
+      return;
+    }
+    const destination = await save({
+      title: "Save Podload state",
+      defaultPath: "podload-state.json",
+      filters: [{ name: "JSON", extensions: ["json"] }]
+    });
+    if (!destination) return;
+    try {
+      const payload = JSON.stringify(
+        { podcasts, activePodcastId, downloadDir },
+        null,
+        2
+      );
+      await writeTextFile(destination, payload);
+      setStatusMessage("State exported.");
+    } catch (error) {
+      setStatusMessage(
+        error instanceof Error ? error.message : "Export failed"
+      );
+    }
+  };
+
+  const handleImportState = async () => {
+    if (!canUseTauriApis()) {
+      setStatusMessage("Import is available in the desktop app runtime.");
+      return;
+    }
+    const selection = await open({
+      title: "Import Podload state",
+      multiple: false,
+      filters: [{ name: "JSON", extensions: ["json"] }]
+    });
+    if (typeof selection !== "string") return;
+    try {
+      const raw = await readTextFile(selection);
+      const parsed = JSON.parse(raw) as unknown;
+      if (!isStoredState(parsed)) {
+        setStatusMessage("Invalid state file.");
+        return;
+      }
+      setPodcasts(parsed.podcasts);
+      setActivePodcastId(parsed.activePodcastId ?? parsed.podcasts?.[0]?.id ?? null);
+      setDownloadDir(parsed.downloadDir ?? "");
+      setStatusMessage("State imported.");
+    } catch (error) {
+      setStatusMessage(
+        error instanceof Error ? error.message : "Import failed"
+      );
+    }
+  };
+
   const handleLoadMore = async () => {
     if (!activePodcast || isLoadingMore) return;
     setIsLoadingMore(true);
@@ -436,6 +491,14 @@ function App() {
           <div>
             <p className="sidebar-title">Podload</p>
             <p className="sidebar-subtitle">Podcast downloads, kept tidy.</p>
+            <div className="sidebar-exports">
+              <button type="button" className="ghost inline" onClick={handleImportState}>
+                Import state
+              </button>
+              <button type="button" className="ghost inline" onClick={handleExportState}>
+                Export state
+              </button>
+            </div>
           </div>
         </div>
 

@@ -76,6 +76,13 @@ input {
   color: var(--muted);
 }
 
+.sidebar-exports {
+  margin-top: 10px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .sidebar-section-header {
   display: flex;
   align-items: center;

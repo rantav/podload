@@ -28,6 +28,26 @@
       ]
     },
     {
+      "identifier": "fs:allow-read-file",
+      "allow": [
+        {
+          "path": "$HOME/**"
+        },
+        {
+          "path": "$DOWNLOAD/**"
+        },
+        {
+          "path": "$DESKTOP/**"
+        },
+        {
+          "path": "$DOCUMENT/**"
+        },
+        {
+          "path": "/Volumes/**"
+        }
+      ]
+    },
+    {
       "identifier": "http:default",
       "allow": [
         "https://*/*",

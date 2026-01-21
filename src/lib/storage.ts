@@ -31,3 +31,9 @@ export const saveStoredState = (state: StoredState): void => {
   if (typeof localStorage === "undefined") return;
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 };
+
+export const isStoredState = (value: unknown): value is StoredState => {
+  if (!value || typeof value !== "object") return false;
+  const maybe = value as { podcasts?: unknown };
+  return Array.isArray(maybe.podcasts);
+};
