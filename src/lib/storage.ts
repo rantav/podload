@@ -1,7 +1,9 @@
+import { BaseDirectory, readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import type { Episode, EpisodeStatus, Podcast, StoredState } from "./types";
 
 export const STORAGE_KEY = "podload_state";
 export const STORAGE_VERSION = 1;
+const STATE_FILENAME = "podload-state.json";
 
 export type PersistedEpisodeState = { id: string; status: EpisodeStatus };
 export type PersistedPodcastState = {
@@ -74,10 +76,7 @@ export const buildPersistedState = (
   }))
 });
 
-export const loadStoredState = (): PersistedState | null => {
-  if (typeof localStorage === "undefined") return null;
-  const raw = localStorage.getItem(STORAGE_KEY);
-  if (!raw) return null;
+const parsePersistedState = (raw: string): PersistedState | null => {
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (isPersistedState(parsed)) return parsed;
@@ -97,10 +96,36 @@ export const loadStoredState = (): PersistedState | null => {
   }
 };
 
+export const loadStoredState = (): PersistedState | null => {
+  if (typeof localStorage === "undefined") return null;
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) return null;
+  return parsePersistedState(raw);
+};
+
+export const loadStoredStateFromFile = async (): Promise<PersistedState | null> => {
+  try {
+    const raw = await readTextFile(STATE_FILENAME, { baseDir: BaseDirectory.AppData });
+    return parsePersistedState(raw);
+  } catch {
+    return null;
+  }
+};
+
 export const saveStoredState = (state: PersistedState): void => {
   if (typeof localStorage === "undefined") return;
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    // Ignore persistence failures to avoid crashing the UI.
+  }
+};
+
+export const saveStoredStateToFile = async (state: PersistedState): Promise<void> => {
+  try {
+    await writeTextFile(STATE_FILENAME, JSON.stringify(state), {
+      baseDir: BaseDirectory.AppData
+    });
   } catch {
     // Ignore persistence failures to avoid crashing the UI.
   }

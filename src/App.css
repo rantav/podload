@@ -550,6 +550,12 @@ input {
   animation: spin 1s linear infinite;
 }
 
+.spinner.large {
+  width: 42px;
+  height: 42px;
+  border-width: 3px;
+}
+
 .load-more {
   display: flex;
   justify-content: center;
@@ -561,6 +567,20 @@ input {
   text-align: center;
   padding: 40px 24px;
   color: var(--muted);
+}
+
+.loading-screen {
+  text-align: center;
+  padding: 80px 24px;
+  color: var(--muted);
+  display: grid;
+  gap: 16px;
+  justify-items: center;
+}
+
+.loading-screen p {
+  margin: 0;
+  font-size: 14px;
 }
 
 .empty-screen h2 {

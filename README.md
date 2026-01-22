@@ -20,13 +20,19 @@ Podload uses Tauri + React. Feeds are parsed from RSS/Atom XML, episodes are lis
 ## Development
 
 Install dependencies:
-```\n+pnpm install\n+```
+```
+pnpm install
+```
 
 Run the desktop app:
-```\n+pnpm run tauri dev\n+```
+```
+pnpm run tauri dev
+```
 
 Run checks:
-```\n+make check\n+```
+```
+make check
+```
 
 ## Export / Import state
 
@@ -34,4 +40,6 @@ Use **Import state** or **Export state** in the sidebar to move the library betw
 
 ## Build & install (macOS)
 
-```\n+make install-mac\n+```
+```
+make install-mac
+```

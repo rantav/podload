@@ -30,7 +30,9 @@ import {
   buildPersistedState,
   isPersistedState,
   loadStoredState,
+  loadStoredStateFromFile,
   saveStoredState,
+  saveStoredStateToFile,
   type PersistedState
 } from "./lib/storage";
 import type { Episode, EpisodeStatus, Podcast } from "./lib/types";
@@ -128,11 +130,18 @@ function App() {
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [playingEpisodeId, setPlayingEpisodeId] = useState<string | null>(null);
+  const [hasHydrated, setHasHydrated] = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const isHydrating = !hasHydrated || (isFetching && podcasts.length === 0);
 
   useEffect(() => {
-    saveStoredState(buildPersistedState(podcasts, activePodcastId, downloadDir));
-  }, [podcasts, activePodcastId, downloadDir]);
+    if (!hasHydrated) return;
+    const nextState = buildPersistedState(podcasts, activePodcastId, downloadDir);
+    saveStoredState(nextState);
+    if (canUseTauriApis()) {
+      void saveStoredStateToFile(nextState);
+    }
+  }, [podcasts, activePodcastId, downloadDir, hasHydrated]);
 
   const applyPersistedState = useCallback(async (state: PersistedState) => {
     setIsFetching(true);
@@ -185,9 +194,25 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!stored?.podcasts?.length) return;
-    void applyPersistedState(stored);
-  }, [applyPersistedState, stored]);
+    let cancelled = false;
+    const hydrate = async () => {
+      let persisted: PersistedState | null = null;
+      if (canUseTauriApis()) {
+        persisted = await loadStoredStateFromFile();
+      }
+      if (!persisted) {
+        persisted = loadStoredState();
+      }
+      if (persisted?.podcasts?.length) {
+        await applyPersistedState(persisted);
+      }
+      if (!cancelled) setHasHydrated(true);
+    };
+    void hydrate();
+    return () => {
+      cancelled = true;
+    };
+  }, [applyPersistedState]);
 
   useEffect(() => {
     setSelectedEpisodeIds(new Set());
@@ -677,7 +702,12 @@ function App() {
       </aside>
 
       <main className="main">
-        {activePodcast ? (
+        {isHydrating ? (
+          <div className="loading-screen">
+            <span className="spinner large" aria-hidden="true" />
+            <p>Loading your podcasts…</p>
+          </div>
+        ) : activePodcast ? (
           <>
             <header className="hero">
               <div className="hero-art">
