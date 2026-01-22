@@ -122,6 +122,7 @@ export const parseFeed = (xml: string, feedUrl: string): ParsedFeed => {
 const fetchText = async (url: string): Promise<string> => {
   const response = await safeFetch(url, {
     method: "GET",
+    maxRedirections: 10,
     headers: {
       "User-Agent": "Podload/0.1",
       Accept: "application/rss+xml, application/atom+xml, text/xml, application/xml, text/html"
