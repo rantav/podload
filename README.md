@@ -43,3 +43,13 @@ Use **Import state** or **Export state** in the sidebar to move the library betw
 ```
 make install-mac
 ```
+
+## Install from GitHub (macOS)
+
+1. Download the latest `.dmg` from the GitHub Releases page.
+2. Open the `.dmg` and drag **Podload.app** into **Applications**.
+3. If macOS says the app is damaged, remove the quarantine flag:
+   ```
+   xattr -dr com.apple.quarantine /Applications/Podload.app
+   ```
+4. Open **Podload** from **Applications**.

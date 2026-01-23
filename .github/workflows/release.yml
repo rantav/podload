@@ -18,8 +18,6 @@ jobs:
             artifactName: macos
           - os: windows-latest
             artifactName: windows
-          - os: ubuntu-latest
-            artifactName: linux
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
