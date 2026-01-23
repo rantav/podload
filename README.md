@@ -1,6 +1,7 @@
 # Podload
 
 ![Podload logo](public/logo.svg)
+![Podload screenshot](public/podload-screenshot.jpg)
 
 Podload is a macOS desktop app for discovering and downloading podcast episodes. Add a podcast homepage or RSS URL, browse episodes, batch download or skip, and keep your library state synced between machines.
 
