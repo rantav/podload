@@ -1,0 +1,42 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifactName: macos
+          - os: windows-latest
+            artifactName: windows
+          - os: ubuntu-latest
+            artifactName: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 9
+      - run: pnpm install
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Podload ${{ github.ref_name }}"
+          releaseBody: "Release ${{ github.ref_name }}"
+          releaseDraft: false
+          prerelease: false
