@@ -257,6 +257,53 @@ fn is_plain_file_name(name: &str) -> bool {
         && Path::new(name).file_name().and_then(|n| n.to_str()) == Some(name)
 }
 
+/// Forces the data of `file` to the device.
+///
+/// On macOS, `sync_all` uses `F_FULLFSYNC`, which also empties the cache of the
+/// device. Some filesystems and devices do not support that command. In that
+/// case use a plain `fsync`, so a download to such a device does not fail.
+async fn sync_to_device(file: &File) -> std::io::Result<()> {
+    match file.sync_all().await {
+        Ok(()) => Ok(()),
+        Err(full_sync_error) => plain_fsync(file).await.map_err(|_| full_sync_error),
+    }
+}
+
+#[cfg(unix)]
+async fn plain_fsync(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // The file stays open until this function returns, so the descriptor is valid.
+    let fd = file.as_raw_fd();
+    tokio::task::spawn_blocking(move || {
+        if unsafe { libc::fsync(fd) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+#[cfg(not(unix))]
+async fn plain_fsync(_file: &File) -> std::io::Result<()> {
+    Err(std::io::Error::other("no fallback"))
+}
+
+/// Makes the rename durable: without this, a sudden disconnect immediately
+/// after the download can keep the old (partial) filename. A failure here is
+/// not an error, because the file itself is complete and synced.
+async fn sync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        if let Ok(dir) = File::open(dir).await {
+            let _ = sync_to_device(&dir).await;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 /// Downloads `url` to `dest`. Returns the size of the file in bytes.
 async fn download_to(
     client: &reqwest::Client,
@@ -284,7 +331,7 @@ async fn download_to(
     if result.is_ok() {
         result = async {
             transfer.file.flush().await?;
-            transfer.file.sync_all().await
+            sync_to_device(&transfer.file).await
         }
         .await
         .map_err(|e| format!("Could not write the file: {e}"));
@@ -303,6 +350,7 @@ async fn download_to(
         let _ = fs::remove_file(&part).await;
         return Err(message);
     }
+    sync_parent_dir(dest).await;
     Ok(received)
 }
 
