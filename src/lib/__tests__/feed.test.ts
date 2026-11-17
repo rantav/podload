@@ -55,3 +55,57 @@ describe("parseFeed", () => {
     expect(parsed.nextUrl).toBe("https://atom.example.com/page2");
   });
 });
+
+describe("episode IDs", () => {
+  const feedWith = (items: string) =>
+    `<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>${items}</channel></rss>`;
+  const item = (n: number) =>
+    `<item><title>Episode ${n}</title><enclosure url="https://example.com/${n}.mp3" /></item>`;
+
+  it("do not change when a new episode is added to a feed without GUIDs", () => {
+    const before = parseFeed(feedWith(item(1) + item(2)), "https://example.com/rss");
+    const after = parseFeed(feedWith(item(3) + item(1) + item(2)), "https://example.com/rss");
+    const idsBefore = before.episodes.map((episode) => episode.id);
+    const idsAfter = after.episodes.map((episode) => episode.id);
+    expect(idsAfter.slice(1)).toEqual(idsBefore);
+    expect(new Set(idsAfter).size).toBe(3);
+  });
+});
+
+describe("descriptions", () => {
+  const feedWithDescription = (description: string) =>
+    `<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>
+      <item><title>E</title><guid>1</guid><description>${description}</description></item>
+    </channel></rss>`;
+
+  it("remove tags and decode entities", () => {
+    const parsed = parseFeed(
+      feedWithDescription("<![CDATA[<p>Tom&nbsp;&amp; Jerry&#39;s</p><p>show &#x263A;</p>]]>"),
+      "https://example.com/rss"
+    );
+    expect(parsed.episodes[0].description).toBe("Tom & Jerry's show ☺");
+  });
+
+  it("are shortened when they are very long", () => {
+    const parsed = parseFeed(
+      feedWithDescription("word ".repeat(1000)),
+      "https://example.com/rss"
+    );
+    expect(parsed.episodes[0].description.length).toBeLessThanOrEqual(601);
+    expect(parsed.episodes[0].description.endsWith("…")).toBe(true);
+  });
+});
+
+describe("parseFeedAsync", () => {
+  it("gives the same result as parseFeed for a large feed", async () => {
+    const items = Array.from(
+      { length: 120 },
+      (_, n) => `<item><title>Episode ${n}</title><guid>g-${n}</guid></item>`
+    ).join("");
+    const xml = `<?xml version="1.0"?><rss version="2.0"><channel><title>Big</title>${items}</channel></rss>`;
+    const { parseFeedAsync } = await import("../feed");
+    expect(await parseFeedAsync(xml, "https://example.com/rss")).toEqual(
+      parseFeed(xml, "https://example.com/rss")
+    );
+  });
+});

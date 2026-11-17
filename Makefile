@@ -10,6 +10,7 @@ lint:
 
 test:
 	pnpm run test
+	cd src-tauri && cargo test
 
 typecheck:
 	pnpm run typecheck

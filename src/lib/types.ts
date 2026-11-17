@@ -21,6 +21,8 @@ export type Podcast = {
   episodes: Episode[];
   nextUrl?: string;
   visibleCount: number;
+  /** Saved statuses of episodes that are not loaded from the feed yet. */
+  pendingStates?: { id: string; status: EpisodeStatus; downloadPath?: string }[];
 };
 
 export type ParsedFeed = {

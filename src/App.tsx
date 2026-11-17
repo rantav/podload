@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
@@ -7,8 +8,9 @@ import {
   type FormEvent
 } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { readTextFile, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   IconCheck,
   IconCheckSquare,
@@ -24,13 +26,25 @@ import {
   IconSquare,
   IconTrash
 } from "./components/Icons";
+import { downloadFile, getDownloadDir, pickDownloadDir as pickNativeDownloadDir } from "./lib/download";
 import { discoverFeedUrl, fetchFeed } from "./lib/feed";
-import { canUseTauriApis, safeFetch } from "./lib/http";
+import {
+  buildEpisodeFilename,
+  createPodcastId,
+  errorMessage,
+  mergeFeedEpisodes,
+  podcastFromSavedState,
+  updateEpisodeStatus,
+  withFeed
+} from "./lib/podcasts";
+import { canUseTauriApis } from "./lib/http";
 import {
   buildPersistedState,
   isPersistedState,
+  loadPodcastCache,
   loadStoredState,
   loadStoredStateFromFile,
+  savePodcastCache,
   saveStoredState,
   saveStoredStateToFile,
   type PersistedState
@@ -41,77 +55,14 @@ import {
   formatDate,
   formatDuration,
   guessExtension,
-  sanitizeFilename,
   shortenUrl
 } from "./lib/utils";
 import "./App.css";
 
-const createPodcastId = (feedUrl: string) => {
-  let hash = 5381;
-  for (let i = 0; i < feedUrl.length; i += 1) {
-    hash = (hash * 33) ^ feedUrl.charCodeAt(i);
-  }
-  return `pod-${Math.abs(hash)}`;
-};
-
-const joinPath = (dir: string, file: string) => `${dir.replace(/\/+$/g, "")}/${file}`;
-
-const shortHash = (value: string) => {
-  let hash = 0;
-  for (let i = 0; i < value.length; i += 1) {
-    hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
-  }
-  return hash.toString(36).slice(0, 5).padEnd(5, "0");
-};
-
-const buildEpisodeFilename = (podcastId: string, episodeId: string, title: string, ext: string) => {
-  const safeTitle = sanitizeFilename(title).slice(0, 60);
-  const suffix = shortHash(`${podcastId}-${episodeId}`);
-  return `${safeTitle}-${suffix}${ext}`;
-};
-
-const mergeEpisodes = (existing: Episode[], incoming: Episode[]): Episode[] => {
-  const existingById = new Map(existing.map((episode) => [episode.id, episode]));
-  const incomingIds = new Set(incoming.map((episode) => episode.id));
-
-  const merged = incoming.map((episode) => {
-    const previous = existingById.get(episode.id);
-    return {
-      ...episode,
-      status: previous?.status ?? "none",
-      downloadPath: previous?.downloadPath
-    };
-  });
-
-  const extras = existing.filter((episode) => !incomingIds.has(episode.id));
-  return [...merged, ...extras];
-};
-
-const updateEpisodeStatus = (
-  podcasts: Podcast[],
-  podcastId: string,
-  episodeIds: string[],
-  updater: (episode: Episode) => Episode
-): Podcast[] =>
-  podcasts.map((podcast) => {
-    if (podcast.id !== podcastId) return podcast;
-    return {
-      ...podcast,
-      episodes: podcast.episodes.map((episode) =>
-        episodeIds.includes(episode.id) ? updater(episode) : episode
-      )
-    };
-  });
-
-const sortEpisodes = (episodes: Episode[]): Episode[] =>
-  [...episodes].sort((a, b) => {
-    const dateA = a.pubDate ? new Date(a.pubDate).getTime() : 0;
-    const dateB = b.pubDate ? new Date(b.pubDate).getTime() : 0;
-    return dateB - dateA;
-  });
-
-const ensureStatusForDownload = (status: EpisodeStatus): EpisodeStatus =>
-  status === "downloaded" ? "downloaded" : "downloading";
+const SAVE_DELAY_MS = 400;
+// The cache is large. Write it only when feed data changes, and not often.
+const CACHE_SAVE_DELAY_MS = 1500;
+const CLOSE_FLUSH_LIMIT_MS = 2000;
 
 function App() {
   const storedRef = useRef(loadStoredState());
@@ -120,7 +71,8 @@ function App() {
   const [activePodcastId, setActivePodcastId] = useState<string | null>(
     stored?.activePodcastId ?? null
   );
-  const [downloadDir, setDownloadDir] = useState(stored?.downloadDir ?? "");
+  // The Rust side owns the download folder. This is a copy for the UI.
+  const [downloadDir, setDownloadDir] = useState("");
   const [selectedEpisodeIds, setSelectedEpisodeIds] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState<"all" | "downloaded">("all");
   const [search, setSearch] = useState("");
@@ -131,82 +83,154 @@ function App() {
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [playingEpisodeId, setPlayingEpisodeId] = useState<string | null>(null);
   const [hasHydrated, setHasHydrated] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  // Download progress per episode: a fraction (0-1), or null when not known.
+  const [downloadProgress, setDownloadProgress] = useState<Record<string, number | null>>({});
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const isHydrating = !hasHydrated || (isFetching && podcasts.length === 0);
+  const deferredSearch = useDeferredValue(search);
+  // Changes when feed data changes. Status changes do not change it.
+  const [feedRevision, setFeedRevision] = useState(0);
+  const markFeedDataChanged = useCallback(() => setFeedRevision((value) => value + 1), []);
+  const podcastsRef = useRef(podcasts);
+  const pendingSavesRef = useRef(new Map<string, () => Promise<void>>());
 
   useEffect(() => {
-    if (!hasHydrated) return;
-    const nextState = buildPersistedState(podcasts, activePodcastId, downloadDir);
-    saveStoredState(nextState);
-    if (canUseTauriApis()) {
-      void saveStoredStateToFile(nextState);
-    }
+    podcastsRef.current = podcasts;
+  }, [podcasts]);
+
+  // Save the state after a short delay, so a burst of changes causes one write.
+  useEffect(() => {
+    if (!hasHydrated) return undefined;
+    const pending = pendingSavesRef.current;
+    const save = async () => {
+      pending.delete("state");
+      const nextState = buildPersistedState(podcasts, activePodcastId, downloadDir);
+      saveStoredState(nextState);
+      if (canUseTauriApis()) await saveStoredStateToFile(nextState);
+    };
+    pending.set("state", save);
+    const timeout = setTimeout(() => void save(), SAVE_DELAY_MS);
+    return () => clearTimeout(timeout);
   }, [podcasts, activePodcastId, downloadDir, hasHydrated]);
 
-  const applyPersistedState = useCallback(async (state: PersistedState) => {
-    setIsFetching(true);
-    const importedPodcasts: Podcast[] = [];
-    for (const entry of state.podcasts) {
-      try {
-        const feed = await fetchFeed(entry.feedUrl);
-        const statusMap = new Map(
-          entry.episodeStates.map((episodeState) => [
-            episodeState.id,
-            episodeState.status === "downloading" ? "none" : episodeState.status
-          ])
-        );
-        const episodes = sortEpisodes(
-          feed.episodes.map((episode) => ({
-            ...episode,
-            status: statusMap.get(episode.id) ?? "none"
-          }))
-        );
-        importedPodcasts.push({
-          id: entry.id,
-          title: feed.title,
-          description: feed.description,
-          imageUrl: feed.imageUrl,
-          siteUrl: feed.siteUrl,
-          feedUrl: feed.feedUrl,
-          episodes,
-          nextUrl: feed.nextUrl,
-          visibleCount: DEFAULT_PAGE_SIZE
+  // Save the feed cache only when feed data changed.
+  useEffect(() => {
+    if (!hasHydrated || feedRevision === 0 || !canUseTauriApis()) return undefined;
+    const pending = pendingSavesRef.current;
+    const save = async () => {
+      pending.delete("cache");
+      await savePodcastCache(podcastsRef.current);
+    };
+    pending.set("cache", save);
+    const timeout = setTimeout(() => void save(), CACHE_SAVE_DELAY_MS);
+    return () => clearTimeout(timeout);
+  }, [feedRevision, hasHydrated]);
+
+  // Do not lose the last change when the window closes.
+  useEffect(() => {
+    const flushSaves = () =>
+      Promise.all(Array.from(pendingSavesRef.current.values()).map((save) => save()));
+    const flush = () => void flushSaves();
+    window.addEventListener("beforeunload", flush);
+    window.addEventListener("pagehide", flush);
+
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    if (canUseTauriApis()) {
+      // The window closes after this handler completes.
+      void getCurrentWindow()
+        .onCloseRequested(async () => {
+          await Promise.race([
+            flushSaves(),
+            new Promise((resolve) => setTimeout(resolve, CLOSE_FLUSH_LIMIT_MS))
+          ]);
+        })
+        .then((stop) => {
+          if (disposed) stop();
+          else unlisten = stop;
         });
-      } catch {
-        setStatusMessage(`Failed to refresh ${entry.feedUrl}`);
-      }
     }
-    if (importedPodcasts.length > 0) {
-      setPodcasts(importedPodcasts);
-      const nextActive =
-        state.activePodcastId &&
-        importedPodcasts.some((podcast) => podcast.id === state.activePodcastId)
-          ? state.activePodcastId
-          : importedPodcasts[0].id;
-      setActivePodcastId(nextActive);
-      setIsFetching(false);
-      return true;
-    } else {
-      setStatusMessage("No podcasts could be imported.");
-      setIsFetching(false);
-      return false;
-    }
+    return () => {
+      disposed = true;
+      unlisten?.();
+      window.removeEventListener("beforeunload", flush);
+      window.removeEventListener("pagehide", flush);
+    };
   }, []);
+
+  /** Loads the feeds in parallel and merges each one when it arrives. */
+  const refreshFeeds = useCallback(async (targets: Pick<Podcast, "id" | "feedUrl">[]) => {
+    if (targets.length === 0) return;
+    setIsRefreshing(true);
+    const failed: string[] = [];
+    await Promise.all(
+      targets.map(async (target) => {
+        try {
+          const feed = await fetchFeed(target.feedUrl);
+          setPodcasts((current) =>
+            current.map((podcast) =>
+              podcast.id === target.id ? withFeed(podcast, feed) : podcast
+            )
+          );
+          markFeedDataChanged();
+        } catch {
+          failed.push(shortenUrl(target.feedUrl));
+        }
+      })
+    );
+    setIsRefreshing(false);
+    if (failed.length > 0) {
+      setStatusMessage(`Could not refresh: ${failed.join(", ")}`);
+    }
+  }, [markFeedDataChanged]);
+
+  /**
+   * Shows the saved podcasts immediately, then refreshes the feeds in the
+   * background. A feed that fails keeps its podcast and its statuses.
+   */
+  const applyPersistedState = useCallback(
+    (state: PersistedState, cache: Podcast[]) => {
+      const cachedById = new Map(cache.map((podcast) => [podcast.id, podcast]));
+      const restored = state.podcasts.map((entry) =>
+        podcastFromSavedState(entry, cachedById.get(entry.id))
+      );
+      setPodcasts(restored);
+      setActivePodcastId(
+        state.activePodcastId &&
+          restored.some((podcast) => podcast.id === state.activePodcastId)
+          ? state.activePodcastId
+          : (restored[0]?.id ?? null)
+      );
+      markFeedDataChanged();
+      void refreshFeeds(restored);
+    },
+    [refreshFeeds, markFeedDataChanged]
+  );
 
   useEffect(() => {
     let cancelled = false;
     const hydrate = async () => {
-      let persisted: PersistedState | null = null;
+      const local = loadStoredState();
+      let persisted = local;
+      let cache: Podcast[] = [];
       if (canUseTauriApis()) {
-        persisted = await loadStoredStateFromFile();
+        const [fromFile, cached, savedDir] = await Promise.all([
+          loadStoredStateFromFile(),
+          loadPodcastCache(),
+          getDownloadDir().catch(() => "")
+        ]);
+        cache = cached;
+        if (!cancelled) setDownloadDir(savedDir);
+        // Use the newest copy. The file is the default.
+        if (fromFile && (!local || (fromFile.savedAt ?? 0) >= (local.savedAt ?? 0))) {
+          persisted = fromFile;
+        }
       }
-      if (!persisted) {
-        persisted = loadStoredState();
-      }
+      if (cancelled) return;
       if (persisted?.podcasts?.length) {
-        await applyPersistedState(persisted);
+        applyPersistedState(persisted, cache);
       }
-      if (!cancelled) setHasHydrated(true);
+      setHasHydrated(true);
     };
     void hydrate();
     return () => {
@@ -243,14 +267,19 @@ function App() {
         filter === "downloaded" ? episode.status === "downloaded" : true
       )
       .filter((episode) => {
-        const term = search.trim().toLowerCase();
+        const term = deferredSearch.trim().toLowerCase();
         if (!term) return true;
         return (
           episode.title.toLowerCase().includes(term) ||
           (episode.description ?? "").toLowerCase().includes(term)
         );
       });
-  }, [activePodcast, filter, search]);
+  }, [activePodcast, filter, deferredSearch]);
+
+  // Show the loading screen only when there is nothing to show yet.
+  const isHydrating =
+    !hasHydrated ||
+    (isRefreshing && activePodcast !== null && activePodcast.episodes.length === 0);
 
   const visibleCount = activePodcast?.visibleCount ?? DEFAULT_PAGE_SIZE;
   const visibleEpisodes = filteredEpisodes.slice(0, visibleCount);
@@ -262,18 +291,18 @@ function App() {
     visibleEpisodes.every((episode) => selectedEpisodeIds.has(episode.id));
 
   const pickDownloadDir = async () => {
-    const selection = await open({
-      directory: true,
-      multiple: false,
-      title: "Choose a download folder"
-    });
-
-    if (typeof selection === "string") {
-      setDownloadDir(selection);
-      return selection;
+    if (!canUseTauriApis()) {
+      setStatusMessage("Downloads require the desktop app runtime.");
+      return "";
     }
-
-    return "";
+    try {
+      const selection = await pickNativeDownloadDir();
+      if (selection) setDownloadDir(selection);
+      return selection;
+    } catch (error) {
+      setStatusMessage(errorMessage(error, "Could not set the download folder"));
+      return "";
+    }
   };
 
   const ensureDownloadDir = async () => {
@@ -304,47 +333,40 @@ function App() {
 
       setPodcasts((current) => {
         const existing = current.find((podcast) => podcast.id === podcastId);
-        const mergedEpisodes = mergeEpisodes(
-          existing?.episodes ?? [],
-          feed.episodes.map((episode) => ({ ...episode, status: "none" }))
+        const nextPodcast = withFeed(
+          existing ?? {
+            id: podcastId,
+            title: feed.title,
+            description: feed.description,
+            feedUrl: feed.feedUrl,
+            episodes: [],
+            visibleCount: DEFAULT_PAGE_SIZE
+          },
+          feed
         );
-
-        const nextPodcast: Podcast = {
-          id: podcastId,
-          title: feed.title,
-          description: feed.description,
-          imageUrl: feed.imageUrl,
-          siteUrl: feed.siteUrl,
-          feedUrl: feed.feedUrl,
-          episodes: sortEpisodes(mergedEpisodes),
-          nextUrl: feed.nextUrl,
-          visibleCount: existing?.visibleCount ?? DEFAULT_PAGE_SIZE
-        };
 
         const others = current.filter((podcast) => podcast.id !== podcastId);
         return [nextPodcast, ...others];
       });
 
+      markFeedDataChanged();
       setActivePodcastId(podcastId);
       setNewUrl("");
       setIsAdding(false);
     } catch (error) {
-      setStatusMessage(
-        error instanceof Error ? error.message : "Failed to add podcast"
-      );
+      setStatusMessage(errorMessage(error, "Failed to add podcast"));
     } finally {
       setIsFetching(false);
     }
   };
 
   const handleRemovePodcast = (podcastId: string) => {
-    setPodcasts((current) => {
-      const updated = current.filter((podcast) => podcast.id !== podcastId);
-      if (activePodcastId === podcastId) {
-        setActivePodcastId(updated[0]?.id ?? null);
-      }
-      return updated;
-    });
+    const remaining = podcasts.filter((podcast) => podcast.id !== podcastId);
+    setPodcasts((current) => current.filter((podcast) => podcast.id !== podcastId));
+    if (activePodcastId === podcastId) {
+      setActivePodcastId(remaining[0]?.id ?? null);
+    }
+    markFeedDataChanged();
   };
 
   const handleRefreshPodcast = async () => {
@@ -355,27 +377,13 @@ function App() {
     try {
       const feed = await fetchFeed(activePodcast.feedUrl);
       setPodcasts((current) =>
-        current.map((podcast) => {
-          if (podcast.id !== activePodcast.id) return podcast;
-          const mergedEpisodes = mergeEpisodes(
-            podcast.episodes,
-            feed.episodes.map((episode) => ({ ...episode, status: "none" }))
-          );
-          return {
-            ...podcast,
-            title: feed.title,
-            description: feed.description,
-            imageUrl: feed.imageUrl,
-            siteUrl: feed.siteUrl,
-            episodes: sortEpisodes(mergedEpisodes),
-            nextUrl: feed.nextUrl ?? podcast.nextUrl
-          };
-        })
+        current.map((podcast) =>
+          podcast.id === activePodcast.id ? withFeed(podcast, feed) : podcast
+        )
       );
+      markFeedDataChanged();
     } catch (error) {
-      setStatusMessage(
-        error instanceof Error ? error.message : "Refresh failed"
-      );
+      setStatusMessage(errorMessage(error, "Refresh failed"));
     } finally {
       setIsFetching(false);
     }
@@ -401,9 +409,7 @@ function App() {
       await writeTextFile(destination, payload);
       setStatusMessage("State exported.");
     } catch (error) {
-      setStatusMessage(
-        error instanceof Error ? error.message : "Export failed"
-      );
+      setStatusMessage(errorMessage(error, "Export failed"));
     }
   };
 
@@ -425,14 +431,15 @@ function App() {
         setStatusMessage("Invalid state file.");
         return;
       }
-      const imported = await applyPersistedState(parsed);
-      if (imported) {
-        setStatusMessage("State imported.");
+      if (parsed.podcasts.length === 0) {
+        setStatusMessage("The state file contains no podcasts.");
+        return;
       }
+      // Keep the feed data of podcasts that are already loaded.
+      applyPersistedState(parsed, podcasts);
+      setStatusMessage("State imported.");
     } catch (error) {
-      setStatusMessage(
-        error instanceof Error ? error.message : "Import failed"
-      );
+      setStatusMessage(errorMessage(error, "Import failed"));
     }
   };
 
@@ -446,18 +453,15 @@ function App() {
         setPodcasts((current) =>
           current.map((podcast) => {
             if (podcast.id !== activePodcast.id) return podcast;
-            const mergedEpisodes = mergeEpisodes(
-              podcast.episodes,
-              feed.episodes.map((episode) => ({ ...episode, status: "none" }))
-            );
             return {
               ...podcast,
-              episodes: sortEpisodes(mergedEpisodes),
+              ...mergeFeedEpisodes(podcast, feed),
               nextUrl: feed.nextUrl,
               visibleCount: podcast.visibleCount + DEFAULT_PAGE_SIZE
             };
           })
         );
+        markFeedDataChanged();
       } else {
         setPodcasts((current) =>
           current.map((podcast) =>
@@ -468,9 +472,7 @@ function App() {
         );
       }
     } catch (error) {
-      setStatusMessage(
-        error instanceof Error ? error.message : "Could not load more episodes"
-      );
+      setStatusMessage(errorMessage(error, "Could not load more episodes"));
     } finally {
       setIsLoadingMore(false);
     }
@@ -525,8 +527,15 @@ function App() {
       return;
     }
     audioRef.current.src = source;
-    void audioRef.current.play();
     setPlayingEpisodeId(episode.id);
+    audioRef.current.play().catch(() => {
+      setPlayingEpisodeId((current) => (current === episode.id ? null : current));
+      setStatusMessage(
+        episode.downloadPath
+          ? "Could not play the downloaded file. Download the episode again."
+          : "Could not play this episode."
+      );
+    });
   };
 
   const downloadEpisode = async (episodeId: string, forcedDir?: string) => {
@@ -542,48 +551,48 @@ function App() {
       return;
     }
 
+    if (episode.status === "downloading") return;
+
     const destinationDir = forcedDir || (await ensureDownloadDir());
     if (!destinationDir) return;
 
-    setPodcasts((current) =>
-      updateEpisodeStatus(current, activePodcast.id, [episodeId], (currentEpisode) => ({
-        ...currentEpisode,
-        status: ensureStatusForDownload(currentEpisode.status)
-      }))
-    );
+    const podcastId = activePodcast.id;
+    const setStatus = (status: EpisodeStatus, downloadPath?: string) =>
+      setPodcasts((current) =>
+        updateEpisodeStatus(current, podcastId, [episodeId], (currentEpisode) => ({
+          ...currentEpisode,
+          status,
+          downloadPath: downloadPath ?? currentEpisode.downloadPath
+        }))
+      );
+
+    setStatus("downloading");
 
     try {
-      const response = await safeFetch(episode.audioUrl, { method: "GET" });
-      if (!response.ok) {
-        throw new Error(`Download failed (${response.status})`);
-      }
-      const bytes = new Uint8Array(await response.arrayBuffer());
       const filename = buildEpisodeFilename(
-        activePodcast.id,
+        podcastId,
         episode.id,
         episode.title,
         guessExtension(episode.audioUrl)
       );
-      const filePath = joinPath(destinationDir, filename);
-      await writeFile(filePath, bytes);
-
-      setPodcasts((current) =>
-        updateEpisodeStatus(current, activePodcast.id, [episodeId], (currentEpisode) => ({
-          ...currentEpisode,
-          status: "downloaded",
-          downloadPath: filePath
-        }))
-      );
+      // The Rust side writes to a partial file in the download folder, verifies
+      // the size, then renames the file.
+      const filePath = await downloadFile(episode.audioUrl, filename, ({ received, total }) => {
+        setDownloadProgress((current) => ({
+          ...current,
+          [episodeId]: total ? received / total : null
+        }));
+      });
+      setStatus("downloaded", filePath);
     } catch (error) {
-      setStatusMessage(
-        error instanceof Error ? error.message : "Episode download failed"
-      );
-      setPodcasts((current) =>
-        updateEpisodeStatus(current, activePodcast.id, [episodeId], (currentEpisode) => ({
-          ...currentEpisode,
-          status: "error"
-        }))
-      );
+      setStatusMessage(`${episode.title}: ${errorMessage(error, "Episode download failed")}`);
+      setStatus("error");
+    } finally {
+      setDownloadProgress((current) => {
+        const next = { ...current };
+        delete next[episodeId];
+        return next;
+      });
     }
   };
 
@@ -593,8 +602,9 @@ function App() {
     if (!destinationDir) return;
 
     const ids = Array.from(selectedEpisodeIds);
-    await Promise.all(ids.map((id) => downloadEpisode(id, destinationDir)));
     setSelectedEpisodeIds(new Set());
+    // The Rust side limits the number of parallel downloads.
+    await Promise.all(ids.map((id) => downloadEpisode(id, destinationDir)));
   };
 
   return (
@@ -821,6 +831,13 @@ function App() {
                 const isDownloaded = episode.status === "downloaded";
                 const isSkipped = episode.status === "skipped";
                 const isPlaying = playingEpisodeId === episode.id;
+                const progress = downloadProgress[episode.id];
+                const progressLabel =
+                  typeof progress === "number"
+                    ? `Downloading ${Math.floor(progress * 100)}%`
+                    : episode.id in downloadProgress
+                      ? "Downloading…"
+                      : "Waiting to download…";
                 const dateLabel = formatDate(episode.pubDate);
                 const durationLabel = formatDuration(episode.duration);
                 const metaLabel = [dateLabel, durationLabel].filter(Boolean).join(" • ");
@@ -851,6 +868,7 @@ function App() {
                             <IconCheck /> Downloaded
                           </span>
                         )}
+                        {isDownloading && <span className="tag">{progressLabel}</span>}
                         {isSkipped && <span className="tag skipped">Skipped</span>}
                         {episode.status === "error" && (
                           <span className="tag error">Download failed</span>
@@ -870,8 +888,8 @@ function App() {
                         type="button"
                         className="icon-button"
                         onClick={() => downloadEpisode(episode.id)}
-                        disabled={isDownloading || isDownloaded || isSkipped}
-                        title="Download"
+                        disabled={isDownloading || isSkipped}
+                        title={isDownloaded ? "Download again" : "Download"}
                       >
                         {isDownloading ? <span className="spinner" /> : <IconDownload />}
                       </button>

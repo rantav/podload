@@ -1,5 +1,5 @@
 import { safeFetch } from "./http";
-import { buildEpisodeId, ensureHttpUrl, resolveUrl, stripHtml } from "./utils";
+import { buildEpisodeId, ensureHttpUrl, resolveUrl, shortenUrl, stripHtml } from "./utils";
 import type { ParsedFeed } from "./types";
 
 const FEED_MIME_RE = /(rss|atom|xml)/i;
@@ -28,7 +28,18 @@ const looksLikeFeed = (doc: Document): boolean => {
   return Boolean(doc.querySelector("rss, feed, rdf\\:RDF"));
 };
 
-export const parseFeed = (xml: string, feedUrl: string): ParsedFeed => {
+// The UI shows three lines of the description. A full blog post for each
+// episode makes the memory, the cache file and the search much larger.
+const MAX_DESCRIPTION_LENGTH = 600;
+
+const shorten = (text: string): string =>
+  text.length > MAX_DESCRIPTION_LENGTH
+    ? `${text.slice(0, MAX_DESCRIPTION_LENGTH).trimEnd()}…`
+    : text;
+
+type FeedHead = Omit<ParsedFeed, "episodes"> & { entries: Element[] };
+
+const parseFeedHead = (xml: string, feedUrl: string): FeedHead => {
   const parser = new DOMParser();
   const doc = parser.parseFromString(xml, "text/xml");
   const parserError = doc.querySelector("parsererror");
@@ -64,76 +75,120 @@ export const parseFeed = (xml: string, feedUrl: string): ParsedFeed => {
 
   const nextUrl = findNextLink(doc);
 
-  const entries = isAtom
-    ? Array.from(root.querySelectorAll("entry"))
-    : Array.from(root.querySelectorAll("item"));
-
-  const episodes = entries.map((entry, index) => {
-    const entryTitle = getText(entry, "title") ?? "Untitled Episode";
-    const entryDescription = stripHtml(
-      getText(entry, "description") ||
-        getText(entry, "summary") ||
-        getText(entry, "content") ||
-        getText(entry, "itunes\\:summary") ||
-        ""
-    );
-
-    const guid = getText(entry, "guid") || getText(entry, "id");
-    const link =
-      getAttr(entry, "link[rel='alternate']", "href") ||
-      getText(entry, "link") ||
-      getAttr(entry, "link", "href");
-
-    const pubDate =
-      getText(entry, "pubDate") ||
-      getText(entry, "published") ||
-      getText(entry, "updated") ||
-      undefined;
-
-    const duration = getText(entry, "itunes\\:duration") || undefined;
-
-    const enclosureUrl =
-      getAttr(entry, "enclosure", "url") ||
-      getAttr(entry, "link[rel='enclosure']", "href") ||
-      getAttr(entry, "media\\:content", "url") ||
-      undefined;
-
-    return {
-      id: buildEpisodeId(feedUrl, guid, link, entryTitle, pubDate, String(index)),
-      title: entryTitle,
-      description: entryDescription,
-      pubDate,
-      duration,
-      audioUrl: enclosureUrl ? resolveUrl(feedUrl, enclosureUrl) : undefined
-    };
-  });
-
   return {
     title,
     description,
     imageUrl: imageUrl ? resolveUrl(feedUrl, imageUrl) : undefined,
     siteUrl: siteUrl ? resolveUrl(feedUrl, siteUrl) : undefined,
     feedUrl,
-    episodes,
-    nextUrl: nextUrl ? resolveUrl(feedUrl, nextUrl) : undefined
+    nextUrl: nextUrl ? resolveUrl(feedUrl, nextUrl) : undefined,
+    entries: Array.from(root.querySelectorAll(isAtom ? "entry" : "item"))
   };
 };
 
-const fetchText = async (url: string): Promise<string> => {
-  const response = await safeFetch(url, {
-    method: "GET",
-    maxRedirections: 10,
-    headers: {
-      "User-Agent": "Podload/0.1",
-      Accept: "application/rss+xml, application/atom+xml, text/xml, application/xml, text/html"
+const parseEntry = (
+  entry: Element,
+  index: number,
+  feedUrl: string
+): ParsedFeed["episodes"][number] => {
+  const title = getText(entry, "title") ?? "Untitled Episode";
+  const description = shorten(
+    stripHtml(
+      getText(entry, "description") ||
+        getText(entry, "summary") ||
+        getText(entry, "content") ||
+        getText(entry, "itunes\\:summary") ||
+        ""
+    )
+  );
+
+  const guid = getText(entry, "guid") || getText(entry, "id");
+  const link =
+    getAttr(entry, "link[rel='alternate']", "href") ||
+    getText(entry, "link") ||
+    getAttr(entry, "link", "href");
+
+  const pubDate =
+    getText(entry, "pubDate") ||
+    getText(entry, "published") ||
+    getText(entry, "updated") ||
+    undefined;
+
+  const duration = getText(entry, "itunes\\:duration") || undefined;
+
+  const enclosureUrl =
+    getAttr(entry, "enclosure", "url") ||
+    getAttr(entry, "link[rel='enclosure']", "href") ||
+    getAttr(entry, "media\\:content", "url") ||
+    undefined;
+  const audioUrl = enclosureUrl ? resolveUrl(feedUrl, enclosureUrl) : undefined;
+
+  return {
+    id: buildEpisodeId(feedUrl, { guid, link, audioUrl, title, pubDate }, index),
+    title,
+    description,
+    pubDate,
+    duration,
+    audioUrl
+  };
+};
+
+export const parseFeed = (xml: string, feedUrl: string): ParsedFeed => {
+  const { entries, ...head } = parseFeedHead(xml, feedUrl);
+  return {
+    ...head,
+    episodes: entries.map((entry, index) => parseEntry(entry, index, feedUrl))
+  };
+};
+
+const PARSE_CHUNK_SIZE = 25;
+
+/**
+ * Same result as `parseFeed`, but it gives control back to the UI between
+ * groups of entries. A feed with hundreds of episodes does not freeze the UI.
+ */
+export const parseFeedAsync = async (xml: string, feedUrl: string): Promise<ParsedFeed> => {
+  const { entries, ...head } = parseFeedHead(xml, feedUrl);
+  const episodes: ParsedFeed["episodes"] = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    if (index > 0 && index % PARSE_CHUNK_SIZE === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
     }
-  });
-
-  if (!response.ok) {
-    throw new Error(`Request failed (${response.status})`);
+    episodes.push(parseEntry(entries[index], index, feedUrl));
   }
+  return { ...head, episodes };
+};
 
-  return response.text();
+const FETCH_TIMEOUT_MS = 45_000;
+
+const fetchText = async (url: string): Promise<string> => {
+  // Without a time limit, a server that does not answer blocks the UI state.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const response = await safeFetch(url, {
+      method: "GET",
+      maxRedirections: 10,
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Podload/0.1",
+        Accept: "application/rss+xml, application/atom+xml, text/xml, application/xml, text/html"
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Request failed (${response.status})`);
+    }
+
+    return await response.text();
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`The request timed out (${shortenUrl(url)})`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 };
 
 export const discoverFeedUrl = async (input: string): Promise<string> => {
@@ -174,5 +229,5 @@ export const discoverFeedUrl = async (input: string): Promise<string> => {
 
 export const fetchFeed = async (feedUrl: string): Promise<ParsedFeed> => {
   const xml = await fetchText(feedUrl);
-  return parseFeed(xml, feedUrl);
+  return parseFeedAsync(xml, feedUrl);
 };

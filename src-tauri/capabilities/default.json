@@ -2,53 +2,16 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
+    "core:window:allow-destroy",
     "opener:default",
     "dialog:default",
     {
-      "identifier": "fs:allow-write-file",
-      "allow": [
-        {
-          "path": "$HOME/**"
-        },
-        {
-          "path": "$DOWNLOAD/**"
-        },
-        {
-          "path": "$DESKTOP/**"
-        },
-        {
-          "path": "$DOCUMENT/**"
-        },
-        {
-          "path": "/Volumes/**"
-        }
-      ]
-    },
-    {
       "identifier": "fs:allow-write-text-file",
-      "allow": [
-        {
-          "path": "$HOME/**"
-        },
-        {
-          "path": "$DOWNLOAD/**"
-        },
-        {
-          "path": "$DESKTOP/**"
-        },
-        {
-          "path": "$DOCUMENT/**"
-        },
-        {
-          "path": "/Volumes/**"
-        }
-      ]
-    },
-    {
-      "identifier": "fs:allow-read-file",
       "allow": [
         {
           "path": "$HOME/**"
